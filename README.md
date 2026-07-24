@@ -1,6 +1,6 @@
 # 🛡 Fuck DPI
 
-Один трей, одно окно, ноль ярлыков в автозагрузке. Приложение объединяет
+Один трей, одно окно. Приложение объединяет
 два независимых инструмента Flowseal под общим управлением:
 
 - **[zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube)** — обход блокировок (Discord, YouTube и т.д.) через `winws.exe`;
