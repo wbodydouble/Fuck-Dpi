@@ -412,24 +412,66 @@ class AppWindow(ctk.CTk):
             fake_tls_domain=self._tls_var.get().strip(),
         )
         save_settings(settings)
-        self._flash_status("Настройки TG WS Proxy сохранены")
-        if self.tgproxy.is_running:
-            self.tgproxy.stop()
+        self._persist_state()
+
+        if not self.tgproxy.is_running:
+            self._flash_status("Настройки TG WS Proxy сохранены")
+            return
+
+        # Перезапуск (stop+start) может занять несколько секунд из-за
+        # корректного закрытия asyncio-сервера -- уводим в фоновый поток,
+        # чтобы не подвешивать GUI.
+        self.tgproxy_toggle_btn.configure(state="disabled")
+        self._flash_status("Настройки сохранены, перезапускаем TG WS Proxy…")
+
+        def worker() -> None:
+            error = None
             try:
+                self.tgproxy.stop()
                 self.tgproxy.start()
             except Exception as e:
-                self._show_error(f"TG WS Proxy: не удалось перезапустить\n{e}")
-            self._refresh_tgproxy()
+                error = str(e)
+            self.dispatch(lambda: self._on_tgproxy_restart_done(error))
+
+        threading.Thread(target=worker, daemon=True, name="tgproxy-restart").start()
+
+    def _on_tgproxy_restart_done(self, error: Optional[str]) -> None:
+        self.tgproxy_toggle_btn.configure(state="normal")
+        if error:
+            self._show_error(f"TG WS Proxy: не удалось перезапустить\n{error}")
+        else:
+            self._flash_status("TG WS Proxy перезапущен с новыми настройками")
+        self._refresh_tgproxy()
         self._persist_state()
 
     def _toggle_tgproxy(self) -> None:
-        if self.tgproxy.is_running:
-            self.tgproxy.stop()
-        else:
+        # stop()/start() у TgProxyRuntime могут блокировать вызывающий поток на
+        # несколько секунд (корректное закрытие asyncio-сервера, живые
+        # соединения) -- выполняем в фоновом потоке, чтобы не подвешивать GUI.
+        starting = not self.tgproxy.is_running
+        self.tgproxy_toggle_btn.configure(state="disabled")
+        self._flash_status("Запускаем TG WS Proxy…" if starting else "Останавливаем TG WS Proxy…")
+
+        def worker() -> None:
+            error = None
             try:
-                self.tgproxy.start()
+                if starting:
+                    self.tgproxy.start()
+                else:
+                    self.tgproxy.stop()
             except Exception as e:
-                self._show_error(f"TG WS Proxy: не удалось запустить\n{e}")
+                error = str(e)
+            self.dispatch(lambda: self._on_tgproxy_toggle_done(starting, error))
+
+        threading.Thread(target=worker, daemon=True, name="tgproxy-toggle").start()
+
+    def _on_tgproxy_toggle_done(self, starting: bool, error: Optional[str]) -> None:
+        self.tgproxy_toggle_btn.configure(state="normal")
+        if error:
+            action = "запустить" if starting else "остановить"
+            self._show_error(f"TG WS Proxy: не удалось {action}\n{error}")
+        else:
+            self._flash_status("TG WS Proxy запущен" if starting else "TG WS Proxy остановлен")
         self._refresh_tgproxy()
         self._persist_state()
 

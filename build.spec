@@ -1,3 +1,11 @@
+# -*- mode: python ; coding: utf-8 -*-
+# Сборка: pyinstaller build.spec
+#
+# Итоговый файл: dist/ZapretTgTray.exe (один exe, без vendor/ внутри,
+# т.к. он подкачивается отдельно при первом запуске).
+# console=False убирает окно консоли у лаунчера.
+# manifest='app.manifest' задаёт requireAdministrator.
+
 from PyInstaller.utils.hooks import collect_data_files
 
 block_cipher = None
@@ -32,6 +40,7 @@ a = Analysis(
     ],
     hookspath=[],
     runtime_hooks=[],
+    # Исключаем явно ненужные модули (опционально)
     excludes=[
         'venv',
         '__pycache__',
@@ -51,14 +60,14 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='Fuck-DPI',
+    name='ZapretTgTray',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,
+    console=False,             # без окна консоли у самого лаунчера
     icon='assets/icon.ico',
     manifest='app.manifest',   # requireAdministrator
 )

@@ -30,11 +30,15 @@ def _is_valid_secret(secret:str) -> bool:
 
 def load_settings():
     if not FILE.exists():
-        return TgProxySettings()
+        s=TgProxySettings()
+        save_settings(s)
+        return s
     try:
         raw=json.loads(FILE.read_text(encoding='utf-8'))
     except Exception:
-        return TgProxySettings()
+        s=TgProxySettings()
+        save_settings(s)
+        return s
     valid={f.name for f in fields(TgProxySettings)}
     filtered={k:v for k,v in raw.items() if k in valid}
     try:
