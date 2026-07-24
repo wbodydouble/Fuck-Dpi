@@ -60,7 +60,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='ZapretTgTray',
+    name='Fuck-DPI',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
