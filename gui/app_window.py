@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import threading
+import tkinter as tk
 from pathlib import Path
 from typing import Callable, Optional
 
 import customtkinter as ctk
 
-from config import LOG_DIR, ZAPRET_LOG, TGPROXY_LOG
+from config import LOG_DIR, ZAPRET_LOG, TGPROXY_LOG, TOR_LOG, TOR_DIR, TOR_DEFAULT_PORT
 from core import autostart, state_store, tg_link, fetch_vendor
 from core.restart import restart_app
 from core.tgproxy_settings import load_settings, save_settings, TgProxySettings
 from gui import theme
+from gui.splash import UpdateProgressDialog, _get_monitor_geometry
 
 WINDOW_MIN_SIZE = (660, 540)
 
@@ -28,17 +31,23 @@ class AppWindow(ctk.CTk):
         self,
         zapret,
         tgproxy,
+        tor,
         state: state_store.AppState,
         on_exit: Callable[[], None],
         update_info: Optional[dict] = None,
+        on_update_info: Optional[Callable[[dict], None]] = None,
     ):
         super().__init__()
 
         self.zapret = zapret
         self.tgproxy = tgproxy
+        self.tor = tor
         self.app_state = state
         self._on_exit_cb = on_exit
         self._update_info: Optional[dict] = update_info
+        self._on_update_info_cb = on_update_info
+        self._destroyed = False
+        self._tick_after_id: Optional[str] = None
 
         theme.setup_appearance(state.appearance_mode)
         self.configure(fg_color=theme.BG_DARK if state.appearance_mode != "light" else theme.BG_LIGHT)
@@ -46,6 +55,8 @@ class AppWindow(ctk.CTk):
         self.title("Fuck DPI")
         self.geometry(state.window_geometry or "700x580")
         self.minsize(*WINDOW_MIN_SIZE)
+        if state.window_geometry is None:
+            self._center_on_screen()
         try:
             self.iconbitmap(str(Path(__file__).resolve().parent.parent / "assets" / "icon.ico"))
         except Exception:
@@ -56,7 +67,7 @@ class AppWindow(ctk.CTk):
         self._build_layout()
         self._refresh_all()
         self._render_update_info()
-        self.after(1500, self._tick)
+        self._schedule_tick()
         self.withdraw()
 
     # ------------------------------------------------------------------
@@ -88,6 +99,7 @@ class AppWindow(ctk.CTk):
 
         self.tab_zapret = self.tabview.add("🛡  Zapret")
         self.tab_tgproxy = self.tabview.add("✈  TG Proxy")
+        self.tab_tor = self.tabview.add("🧅  Tor")
         self.tab_settings = self.tabview.add("⚙  Настройки")
         self.tab_logs = self.tabview.add("🗒  Логи")
 
@@ -98,6 +110,7 @@ class AppWindow(ctk.CTk):
 
         self._build_zapret_tab()
         self._build_tgproxy_tab()
+        self._build_tor_tab()
         self._build_settings_tab()
         self._build_logs_tab()
 
@@ -126,11 +139,14 @@ class AppWindow(ctk.CTk):
         self.header_zapret_badge = theme.StatusBadge(badges, text="Zapret: остановлен", running=False)
         self.header_zapret_badge.pack(side="left", padx=(0, 8))
         self.header_tgproxy_badge = theme.StatusBadge(badges, text="TG Proxy: остановлен", running=False)
-        self.header_tgproxy_badge.pack(side="left")
+        self.header_tgproxy_badge.pack(side="left", padx=(0, 8))
+        self.header_tor_badge = theme.StatusBadge(badges, text="Tor: остановлен", running=False)
+        self.header_tor_badge.pack(side="left")
 
     _TAB_LABELS = {
         "Zapret": "🛡  Zapret",
         "TG Proxy": "✈  TG Proxy",
+        "Tor": "🧅  Tor",
         "Автозапуск": "⚙  Настройки",
         "Настройки": "⚙  Настройки",
         "Логи": "🗒  Логи",
@@ -143,6 +159,7 @@ class AppWindow(ctk.CTk):
         return {
             "🛡  Zapret": "Zapret",
             "✈  TG Proxy": "TG Proxy",
+            "🧅  Tor": "Tor",
             "⚙  Настройки": "Настройки",
             "🗒  Логи": "Логи",
         }.get(label, "Zapret")
@@ -285,6 +302,7 @@ class AppWindow(ctk.CTk):
         self._refresh_zapret()
 
     def _on_strategy_selected(self, *_args) -> None:
+        self.app_state.zapret_strategy = self.strategy_var.get()
         if self.zapret.is_running:
             self._start_zapret()
         self._persist_state()
@@ -490,6 +508,274 @@ class AppWindow(ctk.CTk):
         except Exception as e:
             self._show_error(f"Не удалось собрать ссылку\n{e}")
 
+    # -- Tor -------------------------------------------------------------
+
+    def _build_tor_tab(self) -> None:
+        tab = self.tab_tor
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+
+        scroll_frame = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        scroll_frame.grid(row=0, column=0, sticky="nsew")
+        scroll_frame.grid_columnconfigure(0, weight=1)
+
+        card = theme.make_card(scroll_frame)
+        card.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 12))
+        card.grid_columnconfigure(1, weight=1)
+
+        header = ctk.CTkFrame(card, fg_color="transparent")
+        header.grid(row=0, column=0, columnspan=2, sticky="ew", padx=theme.PAD, pady=(theme.PAD, 6))
+        header.grid_columnconfigure(0, weight=1)
+
+        self.tor_badge = theme.StatusBadge(header, text="Остановлен", running=False)
+        self.tor_badge.grid(row=0, column=0, sticky="w")
+
+        self.tor_toggle_btn = ctk.CTkButton(
+            header, text="Запустить", width=130, height=34, corner_radius=10,
+            fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER, command=self._toggle_tor,
+        )
+        self.tor_toggle_btn.grid(row=0, column=1, sticky="e")
+
+        ctk.CTkFrame(card, fg_color=theme.border_color(), height=1).grid(
+            row=1, column=0, columnspan=2, sticky="ew", padx=theme.PAD, pady=(4, 14)
+        )
+
+        ctk.CTkLabel(
+            card, text="SOCKS5-прокси запустится на 127.0.0.1:{порт}",
+            font=theme.body_font(13), text_color=theme.MUTED,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=theme.PAD)
+
+        port_row = ctk.CTkFrame(card, fg_color="transparent")
+        port_row.grid(row=3, column=0, columnspan=2, sticky="ew", padx=theme.PAD, pady=(6, 14))
+
+        ctk.CTkLabel(port_row, text="Порт", font=theme.body_font(13), text_color=theme.MUTED).pack(
+            side="left", padx=(0, 10)
+        )
+        self._tor_port_var = ctk.StringVar(value=str(self.app_state.tor_port or TOR_DEFAULT_PORT))
+        ctk.CTkEntry(
+            port_row, textvariable=self._tor_port_var, width=90, height=32, corner_radius=8,
+            fg_color=theme.raised_color(),
+        ).pack(side="left")
+
+        btns = ctk.CTkFrame(card, fg_color="transparent")
+        btns.grid(row=4, column=0, columnspan=2, sticky="ew", padx=theme.PAD, pady=(0, 14))
+
+        ctk.CTkButton(
+            btns, text="Сохранить настройки", height=32, corner_radius=8, fg_color=theme.ACCENT,
+            hover_color=theme.ACCENT_HOVER, command=self._save_tor_settings,
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(
+            btns, text="Скопировать адрес", height=32, corner_radius=8, fg_color="transparent",
+            border_width=1, command=self._copy_tor_address,
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(
+            btns, text="Очистить кеш", height=32, corner_radius=8, fg_color="transparent",
+            border_width=1, command=self._clear_tor_cache,
+        ).pack(side="left")
+
+        self.tor_auto_restart_var = ctk.BooleanVar(value=self.app_state.tor_auto_restart)
+        ctk.CTkCheckBox(
+            card, text="Автоматически перезапускать Tor при неожиданном завершении",
+            variable=self.tor_auto_restart_var, font=theme.body_font(13),
+            command=self._on_tor_auto_restart_changed, checkbox_width=20, checkbox_height=20,
+            fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
+        ).grid(row=5, column=0, columnspan=2, sticky="w", padx=theme.PAD, pady=(4, theme.PAD))
+
+        self._build_tor_bridges_card(scroll_frame)
+
+    # ------- карточка «Мосты» ---------------------------------------------
+
+    def _build_tor_bridges_card(self, parent) -> None:
+        card = theme.make_card(parent)
+        card.grid(row=1, column=0, sticky="ew", padx=4, pady=(0, 12))
+        card.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(card, text="Мосты (Bridges)", font=theme.heading_font(15)).grid(
+            row=0, column=0, sticky="w", padx=theme.PAD, pady=(theme.PAD, 2)
+        )
+        ctk.CTkLabel(
+            card,
+            text="Помогают подключиться к Tor, когда провайдер блокирует прямые подключения",
+            font=theme.body_font(12), text_color=theme.MUTED,
+            wraplength=580, justify="left",
+        ).grid(row=1, column=0, sticky="w", padx=theme.PAD, pady=(0, 10))
+
+        self.tor_bridges_enabled_var = ctk.BooleanVar(value=self.app_state.tor_bridges_enabled)
+        ctk.CTkCheckBox(
+            card, text="Использовать мосты", variable=self.tor_bridges_enabled_var,
+            font=theme.body_font(13), command=self._on_tor_bridges_enabled_changed,
+            checkbox_width=20, checkbox_height=20,
+            fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
+        ).grid(row=2, column=0, sticky="w", padx=theme.PAD, pady=(0, 10))
+
+        ctk.CTkLabel(
+            card, text="Список мостов -- по одному на строку",
+            font=theme.body_font(13), text_color=theme.MUTED,
+        ).grid(row=3, column=0, sticky="w", padx=theme.PAD)
+
+        self.tor_bridges_box = ctk.CTkTextbox(
+            card, height=110, font=theme.mono_font(11),
+            fg_color=theme.raised_color(), corner_radius=10,
+        )
+        self.tor_bridges_box.grid(row=4, column=0, sticky="ew", padx=theme.PAD, pady=(6, 10))
+        self.tor_bridges_box.insert("1.0", self.app_state.tor_bridges or "")
+
+        ctk.CTkLabel(
+            card,
+            text=(
+                "Поддерживаются типы: obfs4, snowflake, meek_lite, obfs3.\n"
+                "Пример строки obfs4: obfs4 192.0.2.1:443 0123456789ABCDEF... "
+                "cert=abc... iat-mode=0\n\n"
+                "Получить свои мосты можно на https://bridges.torproject.org/"
+            ),
+            font=theme.body_font(11), text_color=theme.MUTED,
+            justify="left", wraplength=580,
+        ).grid(row=5, column=0, sticky="w", padx=theme.PAD, pady=(0, 10))
+
+        ctk.CTkButton(
+            card, text="Сохранить мосты", height=32, corner_radius=8,
+            fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
+            command=self._save_tor_bridges,
+        ).grid(row=6, column=0, sticky="w", padx=theme.PAD, pady=(0, theme.PAD))
+
+    # ------- обработчики мостов -------------------------------------------
+
+    def _on_tor_bridges_enabled_changed(self) -> None:
+        self.app_state.tor_bridges_enabled = bool(self.tor_bridges_enabled_var.get())
+        self._persist_state()
+
+    def _get_tor_bridges(self) -> Optional[str]:
+        """Возвращает текст мостов для TorManager.start() или None."""
+        if not self.app_state.tor_bridges_enabled:
+            return None
+        text = (self.app_state.tor_bridges or "").strip()
+        return text or None
+
+    def _save_tor_bridges(self) -> None:
+        text = self.tor_bridges_box.get("1.0", "end").rstrip()
+        self.app_state.tor_bridges = text or None
+        self.app_state.tor_bridges_enabled = bool(self.tor_bridges_enabled_var.get())
+        self._persist_state()
+
+        if not self.tor.is_running:
+            self._flash_status("Настройки мостов Tor сохранены")
+            return
+
+        self.tor_toggle_btn.configure(state="disabled")
+        self._flash_status("Мосты изменены, перезапускаем Tor…")
+
+        def worker() -> None:
+            error = None
+            try:
+                self.tor.stop()
+                port = self.app_state.tor_port or TOR_DEFAULT_PORT
+                self.tor.start(port, self._get_tor_bridges())
+            except Exception as e:
+                error = str(e)
+            self.dispatch(lambda: self._on_tor_restart_done(error))
+
+        threading.Thread(target=worker, daemon=True, name="tor-restart").start()
+
+    # -- Tor: продолжение --------------------------------------------------
+
+    def _on_tor_auto_restart_changed(self) -> None:
+        enabled = bool(self.tor_auto_restart_var.get())
+        self.tor.auto_restart_enabled = enabled
+        self.app_state.tor_auto_restart = enabled
+        self._persist_state()
+
+    def _save_tor_settings(self) -> None:
+        try:
+            port = int(self._tor_port_var.get().strip())
+            if not (1 <= port <= 65535):
+                raise ValueError("Порт вне диапазона 1-65535")
+        except ValueError as e:
+            self._show_error(f"Некорректный порт: {e}")
+            return
+        self.app_state.tor_port = port
+        self._persist_state()
+
+        if not self.tor.is_running:
+            self._flash_status("Настройки Tor сохранены")
+            return
+
+        self.tor_toggle_btn.configure(state="disabled")
+        self._flash_status("Порт изменён, перезапускаем Tor…")
+
+        def worker() -> None:
+            error = None
+            try:
+                self.tor.stop()
+                self.tor.start(port, self._get_tor_bridges())
+            except Exception as e:
+                error = str(e)
+            self.dispatch(lambda: self._on_tor_restart_done(error))
+
+        threading.Thread(target=worker, daemon=True, name="tor-restart").start()
+
+    def _on_tor_restart_done(self, error: Optional[str]) -> None:
+        self.tor_toggle_btn.configure(state="normal")
+        if error:
+            self._show_error(f"Tor: не удалось перезапустить\n{error}")
+        else:
+            self._flash_status("Tor перезапущен с новыми настройками")
+        self._refresh_tor()
+        self._persist_state()
+
+    def _copy_tor_address(self) -> None:
+        try:
+            port = int(self._tor_port_var.get().strip())
+        except ValueError:
+            port = self.app_state.tor_port or TOR_DEFAULT_PORT
+        address = f"127.0.0.1:{port}"
+        self.clipboard_clear()
+        self.clipboard_append(address)
+        self._flash_status(f"Адрес SOCKS5 скопирован: {address}")
+
+    def _clear_tor_cache(self) -> None:
+        if self.tor.is_running:
+            self._show_error("Сначала остановите Tor, чтобы очистить кеш")
+            return
+        data_dir = TOR_DIR / "Data"
+        lock_file = TOR_DIR / "lock"
+        try:
+            if data_dir.exists():
+                shutil.rmtree(data_dir)
+            if lock_file.exists():
+                lock_file.unlink()
+            self._flash_status("Кеш Tor очищен")
+        except Exception as e:
+            self._show_error(f"Не удалось очистить кеш: {e}")
+
+    def _toggle_tor(self) -> None:
+        starting = not self.tor.is_running
+        self.tor_toggle_btn.configure(state="disabled")
+        self._flash_status("Запускаем Tor…" if starting else "Останавливаем Tor…")
+
+        def worker() -> None:
+            error = None
+            try:
+                if starting:
+                    port = self.app_state.tor_port or TOR_DEFAULT_PORT
+                    self.tor.start(port, self._get_tor_bridges())
+                else:
+                    self.tor.stop()
+            except Exception as e:
+                error = str(e)
+            self.dispatch(lambda: self._on_tor_toggle_done(starting, error))
+
+        threading.Thread(target=worker, daemon=True, name="tor-toggle").start()
+
+    def _on_tor_toggle_done(self, starting: bool, error: Optional[str]) -> None:
+        self.tor_toggle_btn.configure(state="normal")
+        if error:
+            action = "запустить" if starting else "остановить"
+            self._show_error(f"Tor: не удалось {action}\n{error}")
+        else:
+            self._flash_status("Tor запущен" if starting else "Tor остановлен")
+        self._refresh_tor()
+        self._persist_state()
+
     # -- Настройки (автозапуск + поведение окна) --------------------------
 
     def _build_settings_tab(self) -> None:
@@ -684,21 +970,36 @@ class AppWindow(ctk.CTk):
         ):
             return
 
-        self.zapret.stop()
-        self.tgproxy.stop()
-        self._persist_state()
+        # Блокируем кнопки на время всей операции.
         self.do_update_btn.configure(state="disabled")
         self.check_updates_btn.configure(state="disabled")
+        self.zapret_toggle_btn.configure(state="disabled")
+        self.tgproxy_toggle_btn.configure(state="disabled")
         self._flash_status("Обновление… не закрывайте приложение")
 
+        # Окно прогресса -- то же, что при первом запуске, но поверх главного окна.
+        dialog = UpdateProgressDialog(self)
+
         def worker() -> None:
+            error = None
             try:
+                # Останавливаем процессы в фоновом потоке: остановка tgproxy
+                # может занять несколько секунд, а winws.exe нужно дождаться,
+                # чтобы он отпустил файлы vendor/ перед удалением.
+                self.zapret.stop()
+                self.tgproxy.stop()
+                self.dispatch(self._persist_state)
                 fetch_vendor.perform_update(
-                    progress_cb=lambda msg: self.dispatch(lambda m=msg: self.update_status_label.configure(text=m))
+                    progress_cb=lambda msg: dialog.dispatch(lambda m=msg: dialog.set_status(m))
                 )
-                self.dispatch(restart_app)
             except Exception as e:
-                error_text = str(e)
+                error = str(e)
+
+            dialog.dispatch(dialog.close)
+            if error is None:
+                self.dispatch(restart_app)
+            else:
+                error_text = str(error)
                 self.dispatch(lambda t=error_text: self._on_update_failed(t))
 
         threading.Thread(target=worker, daemon=True, name="perform-update").start()
@@ -706,7 +1007,22 @@ class AppWindow(ctk.CTk):
     def _on_update_failed(self, message: str) -> None:
         self.do_update_btn.configure(state="normal")
         self.check_updates_btn.configure(state="normal")
+        self.zapret_toggle_btn.configure(state="normal")
+        self.tgproxy_toggle_btn.configure(state="normal")
         self._show_error(f"Не удалось обновить\n{message}")
+
+    def apply_startup_update_info(self, info: dict) -> None:
+        """Тихий результат фоновой проверки обновлений при запуске (без сплэша):
+        обновляет вкладку «Настройки», трей и сообщает main.py через колбэк."""
+        self._update_info = info
+        self._render_update_info()
+        if callable(self._on_update_info_cb):
+            try:
+                self._on_update_info_cb(info)
+            except Exception:
+                pass
+        if info.get("update_available"):
+            self._flash_status("Доступно обновление -- смотрите вкладку «Настройки»")
 
     def _toggle_autostart(self) -> None:
         if autostart.is_autostart_installed():
@@ -749,7 +1065,7 @@ class AppWindow(ctk.CTk):
 
         self.log_source_var = ctk.StringVar(value="zapret")
         ctk.CTkSegmentedButton(
-            top, values=["zapret", "tgproxy"], variable=self.log_source_var,
+            top, values=["zapret", "tgproxy", "tor"], variable=self.log_source_var,
             command=lambda *_a: self._refresh_logs(),
             fg_color=theme.raised_color(), selected_color=theme.ACCENT, selected_hover_color=theme.ACCENT_HOVER,
         ).pack(side="left")
@@ -769,7 +1085,13 @@ class AppWindow(ctk.CTk):
         self.log_box.configure(state="disabled")
 
     def _refresh_logs(self) -> None:
-        path = ZAPRET_LOG if self.log_source_var.get() == "zapret" else TGPROXY_LOG
+        source = self.log_source_var.get()
+        if source == "zapret":
+            path = ZAPRET_LOG
+        elif source == "tgproxy":
+            path = TGPROXY_LOG
+        else:
+            path = TOR_LOG
         try:
             text = path.read_text(encoding="utf-8", errors="replace") if path.exists() else "(лог пока пуст)"
         except Exception as e:
@@ -810,6 +1132,13 @@ class AppWindow(ctk.CTk):
         self.header_tgproxy_badge.set_state(f"TG Proxy: {'работает' if running else 'остановлен'}", running)
         self.tgproxy_toggle_btn.configure(text="Остановить" if running else "Запустить")
 
+    def _refresh_tor(self) -> None:
+        running = self.tor.is_running
+        text = "Работает" if running else "Остановлен"
+        self.tor_badge.set_state(text, running)
+        self.header_tor_badge.set_state(f"Tor: {'работает' if running else 'остановлен'}", running)
+        self.tor_toggle_btn.configure(text="Остановить" if running else "Запустить")
+
     def _refresh_autostart(self) -> None:
         installed = autostart.is_autostart_installed()
         admin = autostart.is_admin()
@@ -823,6 +1152,7 @@ class AppWindow(ctk.CTk):
     def _refresh_all(self) -> None:
         self._refresh_zapret()
         self._refresh_tgproxy()
+        self._refresh_tor()
         self._refresh_autostart()
         self._refresh_logs()
 
@@ -833,6 +1163,7 @@ class AppWindow(ctk.CTk):
     def _persist_state(self) -> None:
         self.app_state.zapret_was_running = self.zapret.is_running
         self.app_state.tgproxy_was_running = self.tgproxy.is_running
+        self.app_state.tor_was_running = self.tor.is_running
         try:
             self.app_state.active_tab = self._tab_label_to_key(self.tabview.get())
         except Exception:
@@ -843,20 +1174,53 @@ class AppWindow(ctk.CTk):
             pass
         state_store.save_state(self.app_state)
 
+    def _schedule_tick(self) -> None:
+        if self._destroyed:
+            return
+        try:
+            self._tick_after_id = self.after(1500, self._tick)
+        except tk.TclError:
+            pass
+
     def _tick(self) -> None:
+        if self._destroyed:
+            return
         # Статус мог поменяться сам по себе (процесс упал) -- обновляем и
         # заодно подстраховочно пересохраняем состояние.
         self._refresh_zapret()
         self._refresh_tgproxy()
+        self._refresh_tor()
         self._persist_state()
-        self.after(1500, self._tick)
+        self._schedule_tick()
+
+    def destroy(self) -> None:
+        self._destroyed = True
+        if self._tick_after_id is not None:
+            try:
+                self.after_cancel(self._tick_after_id)
+            except Exception:
+                pass
+        try:
+            super().destroy()
+        except tk.TclError:
+            pass
 
     def _on_close_button(self) -> None:
+        self.app_state.setup_wizard_done = True
         self._persist_state()
         if self.app_state.minimize_to_tray_on_close:
             self.withdraw()
         else:
             self.request_exit()
+
+    def _center_on_screen(self) -> None:
+        self.update_idletasks()
+        width = max(self.winfo_width(), WINDOW_MIN_SIZE[0])
+        height = max(self.winfo_height(), WINDOW_MIN_SIZE[1])
+        mx, my, mw, mh = _get_monitor_geometry(self)
+        x = mx + (mw - width) // 2
+        y = my + (mh - height) // 2
+        self.geometry(f"{width}x{height}+{x}+{y}")
 
     def show(self) -> None:
         self.deiconify()
@@ -880,12 +1244,23 @@ class AppWindow(ctk.CTk):
     # ------------------------------------------------------------------
 
     def _flash_status(self, text: str) -> None:
-        self.status_bar.configure(text=text)
-        self.after(4000, lambda: self.status_bar.configure(text=""))
+        try:
+            self.status_bar.configure(text=text)
+        except tk.TclError:
+            return
+        except Exception:
+            return
+        try:
+            self.after(4000, lambda: self.status_bar.configure(text=""))
+        except tk.TclError:
+            pass
 
     def _show_error(self, text: str) -> None:
         try:
             from tkinter import messagebox
             messagebox.showerror("Fuck DPI", text)
         except Exception:
-            self.status_bar.configure(text=text)
+            try:
+                self.status_bar.configure(text=text)
+            except tk.TclError:
+                pass

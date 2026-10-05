@@ -23,6 +23,13 @@ class AppState:
     # ---------- TG WS Proxy ----------
     tgproxy_was_running: bool = False
 
+    # ---------- Tor ----------
+    tor_was_running: bool = False
+    tor_auto_restart: bool = False
+    tor_port: int = 9050
+    tor_bridges_enabled: bool = False
+    tor_bridges: Optional[str] = None  # многострочный список мостов
+
     # ---------- Первый запуск / автозапуск ----------
     setup_wizard_done: bool = False
     autostart_installed: bool = False

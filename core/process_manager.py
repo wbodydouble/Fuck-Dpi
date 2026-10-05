@@ -90,9 +90,16 @@ class ManagedProcess:
             try:
                 self._proc.terminate()
                 try:
+                    # Дожидаемся фактического завершения: пока процесс жив,
+                    # Windows держит его файлы открытыми (winws.exe, DLL
+                    # WinDivert), и их нельзя удалить/заменить при обновлении.
                     self._proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     self._proc.kill()
+                    try:
+                        self._proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
             except Exception:
                 pass
         self._proc = None

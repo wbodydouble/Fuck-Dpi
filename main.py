@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import threading
+import time
 
 import pystray
 from PIL import Image
 
 from config import ICON_PATH
-from core import autostart, state_store, tg_link
-from core.fetch_vendor import ensure_vendor, check_for_updates
+from core import autostart, state_store, tg_link, fetch_vendor
 from core.zapret_manager import ZapretManager
 from core.tgproxy_manager import TgProxyManager
+from core.tor_manager import TorManager
 from gui.splash import SplashWindow
 
 APP_NAME = "Fuck DPI"
@@ -32,6 +33,7 @@ def _on_state_change(name: str, running: bool) -> None:
 
 zapret = ZapretManager(on_state_change=_on_state_change)
 tgproxy = TgProxyManager(on_state_change=_on_state_change)
+tor = TorManager(on_state_change=_on_state_change)
 
 
 # ---------------------------------------------------------------------------
@@ -79,12 +81,27 @@ def _quick_toggle_tgproxy(icon=None, item=None) -> None:
     _refresh_tray()
 
 
+def _quick_toggle_tor(icon=None, item=None) -> None:
+    if tor.is_running:
+        tor.stop()
+    else:
+        try:
+            state = state_store.load_state()
+            bridges = state.tor_bridges if state.tor_bridges_enabled else None
+            tor.start(bridges=bridges)
+        except Exception:
+            pass
+    _refresh_tray()
+
+
 def _exit_app(icon=None, item=None) -> None:
     zapret.stop()
     tgproxy.stop()
+    tor.stop()
     if _window is not None:
         _window.app_state.zapret_was_running = False
         _window.app_state.tgproxy_was_running = False
+        _window.app_state.tor_was_running = False
         state_store.save_state(_window.app_state)
         _window.dispatch(_window.destroy)
     if _icon is not None:
@@ -94,6 +111,7 @@ def _exit_app(icon=None, item=None) -> None:
 def _build_tray_menu() -> pystray.Menu:
     zapret_running = zapret.is_running
     tgproxy_running = tgproxy.is_running
+    tor_running = tor.is_running
 
     items = [
         pystray.MenuItem("Открыть окно", _show_window, default=True),
@@ -105,6 +123,10 @@ def _build_tray_menu() -> pystray.Menu:
         pystray.MenuItem(
             f"TG WS Proxy: {'работает' if tgproxy_running else 'остановлен'}",
             _quick_toggle_tgproxy,
+        ),
+        pystray.MenuItem(
+            f"Tor: {'работает' if tor_running else 'остановлен'}",
+            _quick_toggle_tor,
         ),
         pystray.Menu.SEPARATOR
     ]
@@ -142,7 +164,36 @@ def _resume_last_session(state: state_store.AppState) -> None:
             tgproxy.start()
         except Exception:
             pass
+    if state.tor_was_running:
+        try:
+            bridges = state.tor_bridges if state.tor_bridges_enabled else None
+            tor.start(state.tor_port, bridges)
+        except Exception:
+            pass
     _refresh_tray()
+
+
+# ---------------------------------------------------------------------------
+# Тихая проверка обновлений (без сплэша)
+# ---------------------------------------------------------------------------
+
+def _set_update_info(info: dict) -> None:
+    global _update_info
+    _update_info = info
+    _refresh_tray()
+
+
+def _quiet_update_check(state: state_store.AppState) -> None:
+    """Фоновая проверка обновлений при обычном запуске: никакого окна,
+    результат тихо появляется в трее и на вкладке «Настройки», когда готов."""
+    if not state.check_updates_on_startup:
+        return
+    try:
+        info = fetch_vendor.check_for_updates()
+    except Exception:
+        return
+    if _window is not None:
+        _window.dispatch(lambda: _window.apply_startup_update_info(info))
 
 
 # ---------------------------------------------------------------------------
@@ -155,52 +206,58 @@ def main() -> None:
     state = state_store.load_state()
     zapret.auto_restart_enabled = state.zapret_auto_restart
     tgproxy.auto_restart_enabled = state.tgproxy_auto_restart
+    tor.auto_restart_enabled = state.tor_auto_restart
 
-    splash = SplashWindow()
-    outcome = {"relaunched": False}
+    # Права администратора нужны драйверу WinDivert -- запрашиваем UAC до
+    # каких-либо окон, чтобы не показывать сплэш зря.
+    if autostart.is_windows() and not autostart.is_admin():
+        if autostart.relaunch_as_admin():
+            return
 
-    def _startup_worker() -> None:
-        global _update_info
-        try:
-            splash.dispatch(lambda: splash.set_status("Проверка файлов Zapret и TG WS Proxy…"))
-            ensure_vendor(progress_cb=lambda msg: splash.dispatch(lambda m=msg: splash.set_status(m)))
-        except Exception as e:
+    # Сплэш показываем ТОЛЬКО когда vendor-файлов нет (первый запуск или
+    # повреждённая установка) и их действительно нужно скачивать с GitHub.
+    # Во всех остальных случаях приложение стартует молча, сразу в трей.
+    if not fetch_vendor.vendor_ready():
+        splash = SplashWindow()
 
-            error_text = str(e)
-            splash.dispatch(lambda t=error_text: splash.set_status(f"Ошибка при загрузке файлов: {t}"))
-
-        if autostart.is_windows() and not autostart.is_admin():
-            splash.dispatch(lambda: splash.set_status("Требуются права администратора…"))
-            if autostart.relaunch_as_admin():
-                outcome["relaunched"] = True
-                splash.dispatch(splash.close)
-                return
-
-        if state.check_updates_on_startup:
-            splash.dispatch(lambda: splash.set_status("Проверка обновлений Zapret и TG WS Proxy…"))
+        def _download_worker() -> None:
             try:
-                _update_info = check_for_updates()
-            except Exception:
-                _update_info = None
+                fetch_vendor.ensure_vendor(
+                    progress_cb=lambda msg: splash.dispatch(lambda m=msg: splash.set_status(m))
+                )
+            except Exception as e:
+                error_text = str(e)
+                # Даём пользователю время прочитать ошибку до закрытия сплэша.
+                splash.dispatch(lambda t=error_text: splash.set_status(f"Ошибка при загрузке файлов: {t}"))
+                time.sleep(4)
+            splash.dispatch(splash.close)
 
-        splash.dispatch(splash.close)
-
-    threading.Thread(target=_startup_worker, daemon=True, name="startup").start()
-    splash.mainloop()
-
-    if outcome["relaunched"]:
-        return
+        threading.Thread(target=_download_worker, daemon=True, name="startup").start()
+        splash.mainloop()
 
     threading.Thread(target=_run_tray, daemon=True).start()
 
     from gui.app_window import AppWindow
 
-    _window = AppWindow(zapret, tgproxy, state, on_exit=_exit_app, update_info=_update_info)
-    _window.after(600, lambda: _resume_last_session(state))
+    _window = AppWindow(
+        zapret, tgproxy, tor, state,
+        on_exit=_exit_app,
+        update_info=_update_info,
+        on_update_info=_set_update_info,
+    )
+    try:
+        _window.after(600, lambda: _resume_last_session(state))
+    except Exception:
+        pass
 
     if not state.setup_wizard_done:
+        try:
+            _window.after(300, _window.show)
+        except Exception:
+            pass
 
-        _window.after(300, _window.show)
+    # Обычный запуск: проверяем обновления тихо, в фоне, без окна загрузки.
+    threading.Thread(target=_quiet_update_check, args=(state,), daemon=True, name="update-check").start()
 
     _window.mainloop()
 

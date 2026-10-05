@@ -28,12 +28,18 @@ TGPROXY_DIR = BASE_DIR / "vendor" / "tgproxy"
 TGPROXY_SRC_DIR = TGPROXY_DIR
 TGPROXY_DEFAULT_PORT = 1443
 
+# ---------- Tor ----------
+TOR_DIR = BASE_DIR / "vendor" / "tor"
+TOR_EXE = TOR_DIR / "tor.exe"
+TOR_DEFAULT_PORT = 9050
+
 # ---------- Логи ----------
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
 ZAPRET_LOG = LOG_DIR / "zapret.log"
 TGPROXY_LOG = LOG_DIR / "tgproxy.log"
+TOR_LOG = LOG_DIR / "tor.log"
 
 # ---------- Данные (настройки, сохранённое состояние) ----------
 DATA_DIR = BASE_DIR / "data"

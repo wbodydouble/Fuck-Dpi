@@ -26,6 +26,7 @@ a = Analysis(
         *customtkinter_datas,
     ],
     hiddenimports=[
+        'pystray',
         'pystray._win32',
         'PIL._tkinter_finder',
         'customtkinter',
@@ -37,6 +38,18 @@ a = Analysis(
         'cryptography.hazmat.primitives.ciphers',
         'cryptography.hazmat.backends.openssl',
         'logging.handlers',
+        # tg-ws-proxy подгружается из vendor/ во время выполнения,
+        # поэтому PyInstaller не видит его импорты при анализе.
+        # Явно включаем httpx и HTTP/2-зависимости, иначе в exe
+        # tgproxy упадёт с ModuleNotFoundError.
+        'httpx',
+        'httpcore',
+        'h2',
+        'hpack',
+        'certifi',
+        'anyio',
+        'sniffio',
+        'idna',
     ],
     hookspath=[],
     runtime_hooks=[],
